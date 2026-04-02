@@ -1,13 +1,13 @@
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
-import plotly.graph_objects as go
 
-st.set_page_config(page_title="Sijoitustyökalu v3", layout="wide")
+st.set_page_config(page_title="Sijoitustyökalu v4", layout="wide")
 
-st.title("Sijoitustyökalu v3")
-st.caption("Yksittäinen analyysi + watchlist omille ja harkinnassa oleville kohteille")
+st.title("Sijoitustyökalu v4")
+st.caption("Yksittäinen analyysi + erilliset listat omille ja harkinnassa oleville kohteille")
 
 DEFAULT_TICKER = "NDA-FI.HE"
 PERIOD_OPTIONS = {
@@ -16,7 +16,8 @@ PERIOD_OPTIONS = {
     "2 vuotta": "2y",
     "5 vuotta": "5y",
 }
-DEFAULT_WATCHLIST = "NDA-FI.HE, KNEBV.HE, NOKIA.HE, SAMPO.HE, UPM.HE, SPY, AAPL"
+DEFAULT_OWNED = "NDA-FI.HE\nKNEBV.HE\nSAMPO.HE"
+DEFAULT_CANDIDATES = "NOKIA.HE\nUPM.HE\nSPY\nAAPL"
 
 
 def normalize_ticker_list(raw: str) -> list[str]:
@@ -28,6 +29,55 @@ def normalize_ticker_list(raw: str) -> list[str]:
         if item not in seen:
             seen.add(item)
             out.append(item)
+    return out
+
+
+@st.cache_data(ttl=3600)
+def load_data(symbol: str, selected_period: str) -> pd.DataFrame:
+    df = yf.download(
+        symbol,
+        period=selected_period,
+        auto_adjust=True,
+        progress=False,
+        group_by="column",
+        threads=False,
+    )
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [
+            "_".join([str(part) for part in col if str(part) != ""]).strip("_")
+            for col in df.columns.to_list()
+        ]
+
+    close_candidates = [c for c in df.columns if "Close" in str(c)]
+    volume_candidates = [c for c in df.columns if "Volume" in str(c)]
+
+    if not close_candidates:
+        return pd.DataFrame()
+
+    close_col = close_candidates[0]
+    volume_col = volume_candidates[0] if volume_candidates else None
+
+    out = pd.DataFrame(index=df.index)
+    out["Close"] = pd.to_numeric(df[close_col], errors="coerce")
+    out["Volume"] = pd.to_numeric(df[volume_col], errors="coerce") if volume_col else np.nan
+    out = out.dropna(subset=["Close"]).copy()
+
+    if out.empty:
+        return pd.DataFrame()
+
+    out["MA20"] = out["Close"].rolling(20).mean()
+    out["MA50"] = out["Close"].rolling(50).mean()
+    out["MA200"] = out["Close"].rolling(200).mean()
+    out["Return_1M"] = out["Close"].pct_change(21)
+    out["Return_3M"] = out["Close"].pct_change(63)
+    out["Return_6M"] = out["Close"].pct_change(126)
+    out["Return_12M"] = out["Close"].pct_change(252)
+    out["Daily_Return"] = out["Close"].pct_change()
+    out["Vol_30D"] = out["Daily_Return"].rolling(30).std() * np.sqrt(252)
     return out
 
 
@@ -82,9 +132,6 @@ def analyze_from_df(df: pd.DataFrame) -> dict:
 
     return {
         "close": close,
-        "ma20": ma20,
-        "ma50": ma50,
-        "ma200": ma200,
         "ret_1m": ret_1m,
         "ret_3m": ret_3m,
         "ret_6m": ret_6m,
@@ -98,53 +145,99 @@ def analyze_from_df(df: pd.DataFrame) -> dict:
     }
 
 
-@st.cache_data(ttl=3600)
-def load_data(symbol: str, selected_period: str) -> pd.DataFrame:
-    df = yf.download(
-        symbol,
-        period=selected_period,
-        auto_adjust=True,
-        progress=False,
-        group_by="column",
-        threads=False,
+def build_watchlist_df(symbols: list[str], selected_period: str, category_label: str) -> pd.DataFrame:
+    rows = []
+    for symbol in symbols:
+        df = load_data(symbol, selected_period)
+        if df.empty:
+            rows.append(
+                {
+                    "Lista": category_label,
+                    "Ticker": symbol,
+                    "Toimintatulkinta": "Ei dataa",
+                    "Trendi": "-",
+                    "Trendipisteet": -1,
+                    "Kurssi": np.nan,
+                    "1 kk %": np.nan,
+                    "3 kk %": np.nan,
+                    "12 kk %": np.nan,
+                    "30 pv vol %": np.nan,
+                }
+            )
+            continue
+
+        r = analyze_from_df(df)
+        rows.append(
+            {
+                "Lista": category_label,
+                "Ticker": symbol,
+                "Toimintatulkinta": r["action"],
+                "Trendi": r["trend_text"],
+                "Trendipisteet": r["score"],
+                "Kurssi": round(r["close"], 2) if pd.notna(r["close"]) else np.nan,
+                "1 kk %": round(r["ret_1m"] * 100, 1) if pd.notna(r["ret_1m"]) else np.nan,
+                "3 kk %": round(r["ret_3m"] * 100, 1) if pd.notna(r["ret_3m"]) else np.nan,
+                "12 kk %": round(r["ret_12m"] * 100, 1) if pd.notna(r["ret_12m"]) else np.nan,
+                "30 pv vol %": round(r["vol_30d"] * 100, 1) if pd.notna(r["vol_30d"]) else np.nan,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def sort_watchlist_df(df: pd.DataFrame) -> pd.DataFrame:
+    signal_order = {"Osta": 0, "Pidä": 1, "Varo": 2, "Myy": 3, "Ei dataa": 4}
+    temp = df.copy()
+    temp["_signal_rank"] = temp["Toimintatulkinta"].map(signal_order).fillna(99)
+    temp = temp.sort_values(
+        ["_signal_rank", "Trendipisteet", "12 kk %"],
+        ascending=[True, False, False],
+    ).drop(columns=["_signal_rank"])
+    return temp
+
+
+def style_watchlist(df: pd.DataFrame):
+    def color_signal(val):
+        if val == "Osta":
+            return "background-color: #d1fae5; color: #065f46; font-weight: bold;"
+        if val == "Pidä":
+            return "background-color: #dbeafe; color: #1e3a8a; font-weight: bold;"
+        if val == "Varo":
+            return "background-color: #fef3c7; color: #92400e; font-weight: bold;"
+        if val == "Myy":
+            return "background-color: #fee2e2; color: #991b1b; font-weight: bold;"
+        return "background-color: #f3f4f6; color: #374151;"
+
+    def color_score(val):
+        try:
+            if val >= 5:
+                return "background-color: #d1fae5;"
+            if val >= 3:
+                return "background-color: #dbeafe;"
+            if val >= 2:
+                return "background-color: #fef3c7;"
+            if val >= 0:
+                return "background-color: #fee2e2;"
+        except Exception:
+            pass
+        return ""
+
+    def color_list(val):
+        if val == "Omat":
+            return "background-color: #ede9fe; color: #5b21b6; font-weight: bold;"
+        if val == "Harkinnassa":
+            return "background-color: #ecfeff; color: #155e75; font-weight: bold;"
+        return ""
+
+    return (
+        df.style
+        .map(color_list, subset=["Lista"])
+        .map(color_signal, subset=["Toimintatulkinta"])
+        .map(color_score, subset=["Trendipisteet"])
     )
 
-    if df is None or df.empty:
-        return pd.DataFrame()
 
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [
-            "_".join([str(part) for part in col if str(part) != ""]).strip("_")
-            for col in df.columns.to_list()
-        ]
-
-    close_candidates = [c for c in df.columns if "Close" in str(c)]
-    volume_candidates = [c for c in df.columns if "Volume" in str(c)]
-
-    if not close_candidates:
-        return pd.DataFrame()
-
-    close_col = close_candidates[0]
-    volume_col = volume_candidates[0] if volume_candidates else None
-
-    out = pd.DataFrame(index=df.index)
-    out["Close"] = pd.to_numeric(df[close_col], errors="coerce")
-    out["Volume"] = pd.to_numeric(df[volume_col], errors="coerce") if volume_col else np.nan
-    out = out.dropna(subset=["Close"]).copy()
-
-    if out.empty:
-        return pd.DataFrame()
-
-    out["MA20"] = out["Close"].rolling(20).mean()
-    out["MA50"] = out["Close"].rolling(50).mean()
-    out["MA200"] = out["Close"].rolling(200).mean()
-    out["Return_1M"] = out["Close"].pct_change(21)
-    out["Return_3M"] = out["Close"].pct_change(63)
-    out["Return_6M"] = out["Close"].pct_change(126)
-    out["Return_12M"] = out["Close"].pct_change(252)
-    out["Daily_Return"] = out["Close"].pct_change()
-    out["Vol_30D"] = out["Daily_Return"].rolling(30).std() * np.sqrt(252)
-    return out
+def count_signals(df: pd.DataFrame, signal: str) -> int:
+    return int((df["Toimintatulkinta"] == signal).sum()) if not df.empty else 0
 
 
 st.sidebar.header("Asetukset")
@@ -153,16 +246,24 @@ period_label = st.sidebar.selectbox("Aikaväli", list(PERIOD_OPTIONS.keys()), in
 period = PERIOD_OPTIONS[period_label]
 show_volume = st.sidebar.checkbox("Näytä volyymi", value=False)
 
-st.sidebar.header("Watchlist")
-watchlist_raw = st.sidebar.text_area(
-    "Omat ja harkinnassa olevat tickerit",
-    value=DEFAULT_WATCHLIST,
-    height=140,
+st.sidebar.header("Omat kohteet")
+owned_raw = st.sidebar.text_area(
+    "Syötä omat tickerit",
+    value=DEFAULT_OWNED,
+    height=110,
     help="Erottele pilkulla, puolipisteellä tai rivinvaihdolla.",
 )
-watchlist = normalize_ticker_list(watchlist_raw)
+owned_list = normalize_ticker_list(owned_raw)
 
-# --- Single ticker view ---
+st.sidebar.header("Harkinnassa")
+candidate_raw = st.sidebar.text_area(
+    "Syötä harkinnassa olevat tickerit",
+    value=DEFAULT_CANDIDATES,
+    height=110,
+    help="Erottele pilkulla, puolipisteellä tai rivinvaihdolla.",
+)
+candidate_list = normalize_ticker_list(candidate_raw)
+
 st.subheader("Yksittäinen analyysi")
 df = load_data(ticker, period)
 
@@ -213,76 +314,35 @@ else:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-# --- Watchlist view ---
 st.subheader("Watchlist")
-st.caption("Väritetty ja pisteiden mukaan järjestetty näkymä omille ja harkinnassa oleville kohteille")
+st.caption("Omat ja harkinnassa olevat kohteet erillään, väritettynä ja parhaasta heikoimpaan järjestettynä")
 
-rows = []
-for symbol in watchlist:
-    wdf = load_data(symbol, period)
-    if wdf.empty:
-        rows.append(
-            {
-                "Ticker": symbol,
-                "Toimintatulkinta": "Ei dataa",
-                "Trendi": "-",
-                "Trendipisteet": -1,
-                "Kurssi": np.nan,
-                "1 kk %": np.nan,
-                "3 kk %": np.nan,
-                "12 kk %": np.nan,
-                "30 pv vol %": np.nan,
-            }
-        )
-        continue
+owned_df = sort_watchlist_df(build_watchlist_df(owned_list, period, "Omat")) if owned_list else pd.DataFrame()
+candidate_df = sort_watchlist_df(build_watchlist_df(candidate_list, period, "Harkinnassa")) if candidate_list else pd.DataFrame()
+combined_df = pd.concat([owned_df, candidate_df], ignore_index=True) if not owned_df.empty or not candidate_df.empty else pd.DataFrame()
 
-    r = analyze_from_df(wdf)
-    rows.append(
-        {
-            "Ticker": symbol,
-            "Toimintatulkinta": r["action"],
-            "Trendi": r["trend_text"],
-            "Trendipisteet": r["score"],
-            "Kurssi": round(r["close"], 2) if pd.notna(r["close"]) else np.nan,
-            "1 kk %": round(r["ret_1m"] * 100, 1) if pd.notna(r["ret_1m"]) else np.nan,
-            "3 kk %": round(r["ret_3m"] * 100, 1) if pd.notna(r["ret_3m"]) else np.nan,
-            "12 kk %": round(r["ret_12m"] * 100, 1) if pd.notna(r["ret_12m"]) else np.nan,
-            "30 pv vol %": round(r["vol_30d"] * 100, 1) if pd.notna(r["vol_30d"]) else np.nan,
-        }
-    )
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Omat yhteensä", len(owned_df) if not owned_df.empty else 0)
+m2.metric("Harkinnassa yhteensä", len(candidate_df) if not candidate_df.empty else 0)
+m3.metric("Osta-signaalit", count_signals(combined_df, "Osta"))
+m4.metric("Myy-signaalit", count_signals(combined_df, "Myy"))
 
-watch_df = pd.DataFrame(rows)
-if not watch_df.empty:
-    signal_order = {"Osta": 0, "Pidä": 1, "Varo": 2, "Myy": 3, "Ei dataa": 4}
-    watch_df["_signal_rank"] = watch_df["Toimintatulkinta"].map(signal_order).fillna(99)
-    watch_df = watch_df.sort_values(["_signal_rank", "Trendipisteet", "12 kk %"], ascending=[True, False, False]).drop(columns=["_signal_rank"])
+all_tab, owned_tab, candidate_tab = st.tabs(["Kaikki", "Omat", "Harkinnassa"])
 
-    def color_signal(val):
-        if val == "Osta":
-            return "background-color: #d1fae5; color: #065f46; font-weight: bold;"
-        if val == "Pidä":
-            return "background-color: #dbeafe; color: #1e3a8a; font-weight: bold;"
-        if val == "Varo":
-            return "background-color: #fef3c7; color: #92400e; font-weight: bold;"
-        if val == "Myy":
-            return "background-color: #fee2e2; color: #991b1b; font-weight: bold;"
-        return "background-color: #f3f4f6; color: #374151;"
+with all_tab:
+    if combined_df.empty:
+        st.info("Watchlist on tyhjä.")
+    else:
+        st.dataframe(style_watchlist(combined_df), use_container_width=True, hide_index=True)
 
-    def color_score(val):
-        try:
-            if val >= 5:
-                return "background-color: #d1fae5;"
-            if val >= 3:
-                return "background-color: #dbeafe;"
-            if val >= 2:
-                return "background-color: #fef3c7;"
-            if val >= 0:
-                return "background-color: #fee2e2;"
-        except Exception:
-            pass
-        return ""
+with owned_tab:
+    if owned_df.empty:
+        st.info("Omat-lista on tyhjä.")
+    else:
+        st.dataframe(style_watchlist(owned_df), use_container_width=True, hide_index=True)
 
-    styled = watch_df.style.map(color_signal, subset=["Toimintatulkinta"]).map(color_score, subset=["Trendipisteet"])
-    st.dataframe(styled, use_container_width=True, hide_index=True)
-else:
-    st.info("Watchlist on tyhjä.")
+with candidate_tab:
+    if candidate_df.empty:
+        st.info("Harkinnassa-lista on tyhjä.")
+    else:
+        st.dataframe(style_watchlist(candidate_df), use_container_width=True, hide_index=True)
