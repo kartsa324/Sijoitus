@@ -14,7 +14,11 @@ period = st.sidebar.selectbox("Aikaväli", ["6mo", "1y", "2y", "5y"])
 
 @st.cache_data
 def load_data(ticker, period):
-    df = yf.download(ticker, period=period)
+    df = yf.download(ticker, period=period, auto_adjust=True, progress=False)
+
+if df is None or df.empty:
+    st.error(f"Dataa ei löytynyt tickerille: {ticker}")
+    st.stop()
     return df
 
 df = load_data(ticker, period)
