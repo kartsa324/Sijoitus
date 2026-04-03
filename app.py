@@ -1,13 +1,15 @@
+
 import json
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="Sijoitustyökalu v6", layout="wide")
+st.set_page_config(page_title="Sijoitustyökalu v7", layout="wide")
 
-st.title("Sijoitustyökalu v6")
-st.caption("Watchlist + tallennus")
+st.title("Sijoitustyökalu v7")
+st.caption("Watchlist + tallennus + muutokset viime tallennukseen")
 
 DEFAULT_OWNED = "NDA-FI.HE\nKNEBV.HE\nSAMPO.HE"
 DEFAULT_WATCH = "NOKIA.HE\nUPM.HE\nSPY\nAAPL\nV3AA.DE"
@@ -101,38 +103,55 @@ def analyze(ticker: str):
     }
 
 
+def build_snapshot(rows, owned_text, watch_text):
+    return {
+        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "owned": owned_text,
+        "watch": watch_text,
+        "signals": {row["Ticker"]: row["Signaali"] for row in rows if row["Signaali"] != "Ei dataa"},
+        "scores": {row["Ticker"]: row["Pisteet"] for row in rows if row["Signaali"] != "Ei dataa"},
+    }
+
+
+def detect_important_changes(previous_signals: dict, current_signals: dict):
+    new_buys = []
+    new_sells = []
+
+    for ticker, new_signal in current_signals.items():
+        old_signal = previous_signals.get(ticker)
+        if not old_signal or old_signal == new_signal:
+            continue
+
+        if new_signal == "Osta" and old_signal in {"Varo", "Myy"}:
+            new_buys.append((ticker, old_signal, new_signal))
+        elif new_signal == "Myy" and old_signal in {"Osta", "Varo"}:
+            new_sells.append((ticker, old_signal, new_signal))
+
+    return new_buys, new_sells
+
+
 st.sidebar.header("💾 Tallennus")
 
 settings = {
     "owned": DEFAULT_OWNED,
     "watch": DEFAULT_WATCH,
 }
+loaded_snapshot = None
 
-uploaded_file = st.sidebar.file_uploader("Lataa tallennetut listat", type="json")
+uploaded_file = st.sidebar.file_uploader("Tuo tallennetut listat", type="json")
 
 if uploaded_file is not None:
     try:
         loaded = json.load(uploaded_file)
         settings["owned"] = loaded.get("owned", DEFAULT_OWNED)
         settings["watch"] = loaded.get("watch", DEFAULT_WATCH)
+        loaded_snapshot = loaded
         st.sidebar.success("Listat ladattu")
     except Exception:
         st.sidebar.error("Tiedoston lukeminen ei onnistunut.")
 
 owned_text = st.sidebar.text_area("Omat kohteet", settings["owned"], height=120)
 watch_text = st.sidebar.text_area("Harkinnassa", settings["watch"], height=140)
-
-save_data = {
-    "owned": owned_text,
-    "watch": watch_text,
-}
-
-st.sidebar.download_button(
-    "💾 Lataa listatiedosto",
-    data=json.dumps(save_data, ensure_ascii=False, indent=2),
-    file_name="sijoituslistat.json",
-    mime="application/json",
-)
 
 owned = parse_tickers(owned_text)
 watch = parse_tickers(watch_text)
@@ -152,9 +171,46 @@ for t in watch:
 
 df = pd.DataFrame(rows)
 
+snapshot = build_snapshot(rows, owned_text, watch_text)
+
+st.sidebar.download_button(
+    "💾 Tallenna listat koneelle",
+    data=json.dumps(snapshot, ensure_ascii=False, indent=2),
+    file_name="sijoituslistat.json",
+    mime="application/json",
+)
+
+st.sidebar.caption("Tallenna tiedosto koneelle aina kun päivität listoja.")
+
 if df.empty:
     st.info("Lisää tickereitä sivupalkkiin.")
 else:
+    previous_signals = loaded_snapshot.get("signals", {}) if loaded_snapshot else {}
+    current_signals = snapshot["signals"]
+    new_buys, new_sells = detect_important_changes(previous_signals, current_signals)
+
+    if loaded_snapshot:
+        st.subheader("🔔 Muutokset viime tallennukseen")
+        saved_at = loaded_snapshot.get("saved_at")
+        if saved_at:
+            st.caption(f"Vertailu tallennukseen: {saved_at}")
+
+        if not new_buys and not new_sells:
+            st.info("Ei tärkeitä muutoksia verrattuna viime tallennettuun tiedostoon.")
+        else:
+            if new_buys:
+                st.success(
+                    "🟢 Uudet ostot\n\n" + "\n".join(
+                        f"- {ticker}: {old} → {new}" for ticker, old, new in new_buys
+                    )
+                )
+            if new_sells:
+                st.error(
+                    "🔴 Uudet myynnit\n\n" + "\n".join(
+                        f"- {ticker}: {old} → {new}" for ticker, old, new in new_sells
+                    )
+                )
+
     signal_rank = {"Osta": 3, "Varo": 2, "Myy": 1, "Ei dataa": 0}
     df["Rank"] = df["Signaali"].map(signal_rank)
     df = df.sort_values(by=["Rank", "Pisteet", "Ticker"], ascending=[False, False, True]).drop(columns=["Rank"])
