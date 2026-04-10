@@ -7,10 +7,10 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="Sijoitustyökalu v8", layout="wide")
+st.set_page_config(page_title="Sijoitustyökalu v9", layout="wide")
 
-st.title("Sijoitustyökalu v8")
-st.caption("Watchlist + tallennus + muutokset viime tallennukseen + kurssi- ja tuottotiedot")
+st.title("Sijoitustyökalu v9")
+st.caption("Watchlist + tallennus + muutokset viime tallennukseen + kurssi- ja tuottotiedot + muutos-sarake")
 
 DEFAULT_OWNED = "NDA-FI.HE\nKNEBV.HE\nSAMPO.HE"
 DEFAULT_WATCH = "NOKIA.HE\nUPM.HE\nSPY\nAAPL\nV3AA.DE"
@@ -70,7 +70,6 @@ def get_data(ticker: str, period: str = "2y") -> pd.DataFrame:
 
     out["MA50"] = out["Close"].rolling(50).mean()
     out["MA200"] = out["Close"].rolling(200).mean()
-
     out["Return_1M"] = out["Close"].pct_change(21)
     out["Return_3M"] = out["Close"].pct_change(63)
     out["Return_12M"] = out["Close"].pct_change(252)
@@ -91,6 +90,7 @@ def analyze(ticker: str) -> dict:
             "12 kk %": np.nan,
             "30 pv vol %": np.nan,
             "Signaali": "Ei dataa",
+            "Muutos": "Ei dataa",
             "Pisteet": -1,
             "Ryhmä": "",
         }
@@ -124,6 +124,16 @@ def analyze(ticker: str) -> dict:
     else:
         signal = "Myy"
 
+    if pd.notna(ret_1m) and pd.notna(close) and pd.notna(ma50):
+        if ret_1m > 0 and close > ma50:
+            change = "Nousee"
+        elif ret_1m < 0 and close < ma50:
+            change = "Laskee"
+        else:
+            change = "Neutraali"
+    else:
+        change = "Ei dataa"
+
     return {
         "Ticker": ticker,
         "Kurssi": close,
@@ -132,6 +142,7 @@ def analyze(ticker: str) -> dict:
         "12 kk %": ret_12m,
         "30 pv vol %": vol_30d,
         "Signaali": signal,
+        "Muutos": change,
         "Pisteet": score,
         "Ryhmä": "",
     }
@@ -269,6 +280,17 @@ else:
             return "background-color: #f3f4f6; color: #6b7280;"
         return ""
 
+    def color_change(val):
+        if val == "Nousee":
+            return "background-color: #d1fae5; color: #065f46;"
+        if val == "Laskee":
+            return "background-color: #fee2e2; color: #991b1b;"
+        if val == "Neutraali":
+            return "background-color: #fef3c7; color: #92400e;"
+        if val == "Ei dataa":
+            return "background-color: #f3f4f6; color: #6b7280;"
+        return ""
+
     format_map = {
         "Kurssi": "{:.2f}",
         "1 kk %": "{:.1f}",
@@ -283,20 +305,20 @@ else:
 
     with tab1:
         st.dataframe(
-            df.style.map(color_signal, subset=["Signaali"]).format(format_map, na_rep="-"),
+            df.style.map(color_signal, subset=["Signaali"]).map(color_change, subset=["Muutos"]).format(format_map, na_rep="-"),
             use_container_width=True,
         )
 
     with tab2:
         own_df = df[df["Ryhmä"] == "Omat"]
         st.dataframe(
-            own_df.style.map(color_signal, subset=["Signaali"]).format(format_map, na_rep="-"),
+            own_df.style.map(color_signal, subset=["Signaali"]).map(color_change, subset=["Muutos"]).format(format_map, na_rep="-"),
             use_container_width=True,
         )
 
     with tab3:
         watch_df = df[df["Ryhmä"] == "Harkinnassa"]
         st.dataframe(
-            watch_df.style.map(color_signal, subset=["Signaali"]).format(format_map, na_rep="-"),
+            watch_df.style.map(color_signal, subset=["Signaali"]).map(color_change, subset=["Muutos"]).format(format_map, na_rep="-"),
             use_container_width=True,
         )
